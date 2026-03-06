@@ -1,0 +1,10 @@
+.uvenv/
+.env/
+.pytest_cache/
+__pycache__/
+other/
+logs/
+TODO.md
+
+models/
+data/
