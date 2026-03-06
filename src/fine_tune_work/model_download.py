@@ -16,4 +16,4 @@ def download_qwen_embedding_model(
         print(f"An error occurred during download: {e}")
         raise
 
-download_qwen_embedding_model("/home/mccarryster/very_big_work_ubuntu/ML_projects/llm_rl_fine_tune/models/qwen2.5_1.5B", "Qwen/Qwen2.5-1.5B")
+download_qwen_embedding_model("/home/mccarryster/very_big_work_ubuntu/ML_projects/llm_rl_fine_tune/models/llama3.2_1B", "meta-llama/Llama-3.2-1B")
