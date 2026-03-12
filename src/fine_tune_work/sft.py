@@ -1,4 +1,5 @@
 from datasets import load_from_disk, Dataset
+from functools import partial
 from typing import Any
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model, TaskType
@@ -103,7 +104,6 @@ def train_sft(
     model, tokenizer = load_model_and_tokenizer(model_name, use_lora=use_lora)
 
     # 3. Tokenize lazily using .map() — processes one batch at a time, no RAM spike
-    from functools import partial
     tokenize_fn = partial(convert_and_tokenize, tokenizer=tokenizer)
 
     tokenized_train = train_dataset.map(
