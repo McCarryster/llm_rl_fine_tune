@@ -1,66 +1,69 @@
-from datasets import load_from_disk, Dataset
-from functools import partial
+from datasets import load_dataset
+from typing import List
 from typing import Any
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model, TaskType
 from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
 import torch
 import sft_cfg as cfg
+from trl.trainer.sft_trainer import SFTTrainer
+from trl.trainer.sft_config import SFTConfig
 import os
 
 
-def convert_and_tokenize(sample, tokenizer):
-    """
-    1. Convert \n\nHuman:/\n\nAssistant: format to Qwen's chat template
-    2. Tokenize and mask everything before last assistant response with -100
-    """
-    # Step 1. Convert to Qwen format
-    text = sample["text"]
-    messages = []
+def load_streaming_dataset(dataset_dir: str):
+    arrow_files: List[str] = []
+    for shard in sorted(os.listdir(dataset_dir)):
+        shard_path = os.path.join(dataset_dir, shard)
+        for f in os.listdir(shard_path):
+            if f.endswith(".arrow"):
+                arrow_files.append(os.path.join(shard_path, f))
+ 
+    print(f"[Dataset] Found {len(arrow_files)} arrow shard(s) in {dataset_dir}")
+    return load_dataset("arrow", data_files=arrow_files, split="train", streaming=True)
 
-    segments = text.split("\n\nHuman: ")
-    segments = [s for s in segments if s.strip()]
 
-    for segment in segments:
-        if "\n\nAssistant: " in segment:
-            human_part, assistant_part = segment.split("\n\nAssistant: ", 1)
-            messages.append({"role": "user",      "content": human_part.strip()})
-            messages.append({"role": "assistant", "content": assistant_part.strip()})
-        else:
-            messages.append({"role": "user", "content": segment.strip()})
+def run_oom_probe(model, batch_size: int, eval_batch_size: int, max_seq_len: int, device: str = "cuda") -> None:
+    print(f"\n[OOM Probe] train_batch={batch_size}, eval_batch={eval_batch_size}, seq_len={max_seq_len}")
 
-    formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    def make_batch(bs):
+        return (
+            torch.ones(bs, max_seq_len, dtype=torch.long, device=device),
+            torch.ones(bs, max_seq_len, dtype=torch.long, device=device),
+            torch.ones(bs, max_seq_len, dtype=torch.long, device=device),
+        )
 
-    tokenized = tokenizer(
-        formatted,
-        truncation=True,
-        add_special_tokens=False,
-        max_length=cfg.MAX_SEQ_LEN,
-        padding="max_length",
-        return_tensors="pt",
-    )
-    input_ids = tokenized.input_ids[0]
-    labels = torch.full_like(input_ids, -100)
+    try:
+        # Training step — worst case memory state
+        ids, labels, mask = make_batch(batch_size)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            out = model(input_ids=ids, attention_mask=mask, labels=labels)
+            out.loss.backward()
+        model.zero_grad(set_to_none=True)
 
-    # Step 2. Mask everything before last assistant response
-    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-    assistant_header_ids = tokenizer.encode("assistant\n", add_special_tokens=False)
+        # Eval step — larger batch, no grad, but optimizer states still in VRAM
+        ids, labels, mask = make_batch(eval_batch_size)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            model(input_ids=ids, attention_mask=mask, labels=labels)
 
-    input_ids_list = input_ids.tolist()
-    last_im_start = len(input_ids_list) - 1 - input_ids_list[::-1].index(im_start_id)
-    response_start = last_im_start + 1 + len(assistant_header_ids)
-    labels[response_start:] = input_ids[response_start:]
+        torch.cuda.empty_cache()
+        print(f"[OOM Probe] ✓ Passed\n")
 
-    return {
-        "input_ids":      input_ids.tolist(),   # store as lists, not tensors
-        "attention_mask": tokenized.attention_mask[0].tolist(),
-        "labels":         labels.tolist(),
-    }
+    except torch.OutOfMemoryError as e:
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+        raise RuntimeError(
+            f"[OOM Probe] ✗ Failed at eval_batch={eval_batch_size}\n"
+            f"  → Reduce per_device_eval_batch_size\n"
+            f"  Original error: {e}"
+        )
 
 
 def load_model_and_tokenizer(model_path: str, use_lora: bool = False) -> Any:
 
     model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16, device_map="auto", local_files_only=True)
+    model.config.use_cache = False
+
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -78,6 +81,7 @@ def load_model_and_tokenizer(model_path: str, use_lora: bool = False) -> Any:
         )
 
         model = get_peft_model(model, config)
+        model.enable_input_require_grads() # type: ignore
         model.print_trainable_parameters()
 
     return model, tokenizer
@@ -91,61 +95,44 @@ def train_sft(
     use_lora: bool = True,
 ) -> None:
 
-    # 1. Load and check data
-    train_dataset = load_from_disk(train_dataset_path)
-    test_dataset = load_from_disk(test_dataset_path)
-    print(f"SFT train size: {len(train_dataset)}")
-    print(f"SFT test size:  {len(test_dataset)}")
-    print("\nExample datapoint:")
-    print(train_dataset[1]["text"])
-    print('#'*100)
+
+    train_dataset = load_streaming_dataset(train_dataset_path)
+    train_dataset = train_dataset.shuffle(buffer_size=10000)
+    test_dataset = load_streaming_dataset(test_dataset_path)
 
     # 2. Load model and tokenizer
     model, tokenizer = load_model_and_tokenizer(model_name, use_lora=use_lora)
-
-    # 3. Tokenize lazily using .map() — processes one batch at a time, no RAM spike
-    tokenize_fn = partial(convert_and_tokenize, tokenizer=tokenizer)
-
-    tokenized_train = train_dataset.map(
-        tokenize_fn,
-        remove_columns=train_dataset.column_names,  # type: ignore
-        batched=False,
-        num_proc=4,         # keep at 1 to avoid multiprocess memory issues
-    )
-    tokenized_test = test_dataset.map(
-        tokenize_fn,
-        remove_columns=test_dataset.column_names, # type: ignore
-        batched=False,
-        num_proc=4,
-    )
-
-    tokenized_train.set_format("torch")
-    tokenized_test.set_format("torch")
+    run_oom_probe(model, batch_size=cfg.BATCH_SIZE, eval_batch_size=cfg.EVAL_BATCH_SIZE, max_seq_len=cfg.MAX_SEQ_LEN)
 
     # 4. Define train args
-    training_args = TrainingArguments(
-        output_dir=cfg.OUTPUT_DIR,
-        num_train_epochs=cfg.EPOCHS,
+    sft_config = SFTConfig(
+        output_dir=output_dir,
+        max_steps=cfg.MAX_STEPS,
         per_device_train_batch_size=cfg.BATCH_SIZE,
-        gradient_checkpointing=cfg.GRAD_CHECKPOINT,
         gradient_accumulation_steps=cfg.GRAD_ACCUM,
         learning_rate=cfg.LR,
         bf16=True,
-        logging_steps=10,
+        gradient_checkpointing=cfg.GRAD_CHECKPOINT,
+        logging_steps=cfg.LOG_STEPS,
         eval_strategy="steps",
-        eval_steps=200,
-        save_steps=600,
+        eval_steps=cfg.EVAL_STEPS,
+        per_device_eval_batch_size=cfg.EVAL_BATCH_SIZE,
+        # eval_accumulation_steps=16,
+        save_steps=2000,
         save_total_limit=2,
-        load_best_model_at_end=True,
+        warmup_steps=500,
+        lr_scheduler_type="cosine",
         report_to="none",
+        dataloader_num_workers=2,
+        dataloader_pin_memory=True,
+        packing=False,
     )
 
-    # 5. Define trainer
-    trainer = Trainer(
+    trainer = SFTTrainer(
         model=model,
-        args=training_args,
-        train_dataset=tokenized_train, # type: ignore
-        eval_dataset=tokenized_test, # type: ignore
+        args=sft_config,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
     )
 
     # 6. Start training
